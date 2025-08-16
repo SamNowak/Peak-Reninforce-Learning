@@ -12,6 +12,7 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import gymnasium as gym
 import numpy as np
 import peak_env  # Ensure peak_env.py is in the path
+from peak_env_wrapper import make_wrapped_env  # Import the wrapper
 
 
 class CustomCNN(BaseFeaturesExtractor):
@@ -146,24 +147,6 @@ class CurriculumCallback(CheckpointCallback):
         return super()._on_step()
 
 
-def make_env(rank, seed=0, log_dir="./logs/ppo", difficulty='easy', frame_skip=2):
-    """Create a single environment instance"""
-    def _init():
-        env = gym.make("Peak-v4", 
-                      obs_mode='pixels',
-                      difficulty=difficulty,
-                      frame_skip=frame_skip)
-        
-        os.makedirs(log_dir, exist_ok=True)
-        monitor_path = os.path.join(log_dir, f"monitor_{rank}.csv")
-        env = Monitor(env, filename=monitor_path, 
-                     info_keywords=('height', 'stamina', 'success_rate'))
-        env.action_space.seed(seed + rank)
-        set_random_seed(seed + rank)
-        return env
-    
-    return _init
-
 
 def linear_schedule(initial_value: float):
     """Linear learning rate schedule"""
@@ -179,21 +162,26 @@ def main(args):
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    
-    # Create vectorized environment
+
+    # Create vectorized environment WITH WRAPPER
     print(f"Creating {args.n_envs} parallel environments...")
-    
+
+    # Import the wrapper function
+    from peak_env_wrapper import make_wrapped_env
+
     if args.vec_env_type == "dummy":
-        env_fns = [make_env(i, seed=args.seed, log_dir=args.log_dir, 
-                          difficulty=args.start_difficulty, frame_skip=args.frame_skip) 
-                  for i in range(args.n_envs)]
+        env_fns = [make_wrapped_env(i, seed=args.seed, log_dir=args.log_dir,
+                                    difficulty=args.start_difficulty, frame_skip=args.frame_skip,
+                                    use_simplified=args.use_simplified)
+                   for i in range(args.n_envs)]
         vec_env = DummyVecEnv(env_fns)
     else:
-        env_fns = [make_env(i, seed=args.seed, log_dir=args.log_dir,
-                          difficulty=args.start_difficulty, frame_skip=args.frame_skip) 
-                  for i in range(args.n_envs)]
+        env_fns = [make_wrapped_env(i, seed=args.seed, log_dir=args.log_dir,
+                                    difficulty=args.start_difficulty, frame_skip=args.frame_skip,
+                                    use_simplified=args.use_simplified)
+                   for i in range(args.n_envs)]
         vec_env = SubprocVecEnv(env_fns, start_method='spawn')
-    
+
     vec_env = VecMonitor(vec_env)
     
     # Callbacks
@@ -209,8 +197,16 @@ def main(args):
     )
     
     # Evaluation environment
+    from peak_env_wrapper import FlattenActionWrapper, SimplifiedPeakWrapper
+
+    # Create eval env with wrapper
+    eval_env = gym.make("Peak-v4", obs_mode='pixels', difficulty='medium', frame_skip=args.frame_skip)
+    if args.use_simplified:
+        eval_env = SimplifiedPeakWrapper(eval_env)
+    else:
+        eval_env = FlattenActionWrapper(eval_env)
     eval_env = Monitor(
-        gym.make("Peak-v4", obs_mode='pixels', difficulty='medium', frame_skip=args.frame_skip),
+        eval_env,
         filename=os.path.join(args.log_dir, "ppo_eval.csv"),
         info_keywords=('height', 'stamina', 'success_rate')
     )
@@ -347,6 +343,8 @@ if __name__ == "__main__":
     parser.add_argument("--n_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--vec_env_type", type=str, default="dummy", choices=["dummy", "subproc"],
                        help="Type of vectorized environment")
+    parser.add_argument("--use_simplified", action="store_true",
+                        help="Use simplified action space (recommended for beginners)")
     parser.add_argument("--start_difficulty", type=str, default="easy", 
                        choices=["easy", "medium", "hard"], help="Starting difficulty")
     parser.add_argument("--frame_skip", type=int, default=2, help="Frame skip for faster processing")
