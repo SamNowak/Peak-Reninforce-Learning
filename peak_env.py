@@ -13,7 +13,7 @@ import os
 
 class PeakEnv(gym.Env):
     """Enhanced Peak Environment with optimizations and latest game mechanics"""
-    metadata = {'render.modes': ['human','rgb_array']}
+    metadata = {'render_modes': ['human', 'rgb_array']}
 
     def __init__(self,
                  obs_mode='pixels',
@@ -167,7 +167,12 @@ class PeakEnv(gym.Env):
     def step(self, action):
         """Execute action with new mechanics and optimizations"""
         keys, cam, scr = action['keys'], action['camera'], action['scroll']
-        mh, mv, jmp, spr, crh, itc, drp, emo, png, clb = keys
+
+        # Check the length to handle both old and new formats
+        if len(keys) == 11:
+            mh, mv, jmp, spr, crh, itc, drp, emo, png, clb, _ = keys  # 11 elements
+        else:
+            mh, mv, jmp, spr, crh, itc, drp, emo, png, clb = keys  # 10 elements
 
         # Check for stamina spam exploit prevention (new in latest patch)
         current_time = time.time()
@@ -179,7 +184,7 @@ class PeakEnv(gym.Env):
 
         # Execute actions asynchronously for better performance
         action_future = self.executor.submit(
-            self._execute_actions, 
+            self._execute_actions,
             mh, mv, jmp, spr, crh, itc, drp, emo, png, clb, cam, scr
         )
 
@@ -304,7 +309,11 @@ class PeakEnv(gym.Env):
         rope_eff = self.nu * (1.0 - abs(scr[0]))
         
         # Action sparsity (reduced penalty)
-        mh, mv, jmp, spr, crh, itc, drp, emo, png, clb = keys
+        # Handle both 10 and 11 element formats
+        if len(keys) == 11:
+            mh, mv, jmp, spr, crh, itc, drp, emo, png, clb, _ = keys  # 11 elements
+        else:
+            mh, mv, jmp, spr, crh, itc, drp, emo, png, clb = keys  # 10 elements
         sparsity_count = (mh != 1) + (mv != 1) + jmp + spr + crh + itc + drp + emo + png + clb
         action_sparsity_pen = self.psi * sparsity_count
         

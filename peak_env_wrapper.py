@@ -7,61 +7,62 @@ from typing import Dict, Any
 class FlattenActionWrapper(gym.ActionWrapper):
     """
     Wrapper to convert Dict action space to flat Box space for Stable-Baselines3 compatibility.
-    
+
     Original action space:
-    - keys: MultiDiscrete([3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2])  # 11 discrete actions
+    - keys: MultiDiscrete([3, 3, 2, 2, 2, 2, 2, 2, 2, 2])  # 10 discrete actions
     - camera: Box(-1, 1, (2,))  # 2 continuous
     - scroll: Box(-1, 1, (1,))  # 1 continuous
-    
-    Flattened to: Box(-1, 1, (14,))  # All continuous
+
+    Flattened to: Box(-1, 1, (13,))  # All continuous
     """
-    
+
     def __init__(self, env):
         super().__init__(env)
-        
+
         # Store original action space
         self.original_action_space = env.action_space
-        
+
+        # Get the actual number of key actions
+        self.n_keys = len(self.original_action_space['keys'].nvec)
+
         # Create flattened continuous action space
-        # 11 discrete actions (converted to continuous -1 to 1) + 2 camera + 1 scroll = 14 total
+        # n_keys discrete actions + 2 camera + 1 scroll
         self.action_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(14,),
+            shape=(self.n_keys + 3,),  # Dynamic based on actual keys
             dtype=np.float32
         )
-        
+
         # Store discrete action dimensions for conversion
         self.discrete_dims = self.original_action_space['keys'].nvec
-        
+
     def action(self, action):
         """Convert flat continuous action to original Dict format."""
-        
+
         # Split the flat action array
-        # First 11 for keys, next 2 for camera, last 1 for scroll
-        keys_continuous = action[:11]
-        camera_action = action[11:13]
-        scroll_action = action[13:14]
-        
+        keys_continuous = action[:self.n_keys]
+        camera_action = action[self.n_keys:self.n_keys + 2]
+        scroll_action = action[self.n_keys + 2:self.n_keys + 3]
+
         # Convert continuous values to discrete for keys
         keys_discrete = []
         for i, (cont_val, n_actions) in enumerate(zip(keys_continuous, self.discrete_dims)):
             # Convert from [-1, 1] to discrete action
-            # Scale to [0, n_actions-1] and round
             discrete_val = int(np.clip(
                 (cont_val + 1.0) * (n_actions - 1) / 2.0 + 0.5,
                 0,
                 n_actions - 1
             ))
             keys_discrete.append(discrete_val)
-        
+
         # Construct the Dict action
         dict_action = {
             'keys': np.array(keys_discrete, dtype=np.int64),
             'camera': np.clip(camera_action, -1.0, 1.0).astype(np.float32),
             'scroll': np.clip(scroll_action, -1.0, 1.0).astype(np.float32)
         }
-        
+
         return dict_action
 
 
