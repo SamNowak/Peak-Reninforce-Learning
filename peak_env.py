@@ -4,6 +4,8 @@ import cv2
 import time
 import threading
 import pyautogui
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.01
 from gymnasium import spaces
 from mss import mss
 from collections import defaultdict, deque
@@ -21,13 +23,25 @@ class PeakEnv(gym.Env):
                  hud_crop=None,
                  dt: float = 0.05,
                  frame_skip: int = 2,
-                 difficulty='easy'):
+                 difficulty='easy',
+                 output_res=(128, 128),   # <— NEW: downscaled game frame returned to the agent
+                 hud_res=(64, 128),       # <— NEW: downscaled HUD returned to the agent
+                 grayscale=True,
+                 window_title=None,
+                 auto_snap_window=True):         # <— NEW: use 1 channel to cut memory
         super().__init__()
-        assert obs_mode in ('pixels','features')
+        assert obs_mode in ('pixels', 'features')
+        self.window_title = window_title
+        self.auto_snap_window = auto_snap_window
         self.obs_mode = obs_mode
         self.dt = dt
         self.frame_skip = frame_skip
         self.difficulty = difficulty
+        self.output_res = tuple(output_res)
+        self.hud_res = tuple(hud_res)
+        self.grayscale = bool(grayscale)
+        self._obs_channels = 1 if self.grayscale else 3
+
 
         # Difficulty settings (for curriculum learning)
         self.difficulty_settings = {
@@ -37,91 +51,70 @@ class PeakEnv(gym.Env):
         }
         self.current_settings = self.difficulty_settings[difficulty]
 
-        # Action space (unchanged but with better descriptions)
+        # Action space
         keys   = spaces.MultiDiscrete([3, 3] + [2]*8 + [2])  # movement + actions
         camera = spaces.Box(-1.0, 1.0, (2,), dtype=np.float32)
         scroll = spaces.Box(-1.0, 1.0, (1,), dtype=np.float32)
-        self.action_space = spaces.Dict({
-            'keys':   keys,
-            'camera': camera,
-            'scroll': scroll
-        })
+        self.action_space = spaces.Dict({'keys': keys, 'camera': camera, 'scroll': scroll})
 
-        # Capture regions with default values
-        H, W = 720, 1280
-        self.crop     = crop     or {'top': 100, 'left': 320, 'width': W, 'height': H}
-        self.hud_crop = hud_crop or {'top': 820, 'left': 50,  'width': 400, 'height': 200}
+        # Screen capture regions (high-res capture; we resize before returning to the agent)
+        H, W = 768, 1280
+        self.crop = {'top': 120 + 32, 'left': 320 + 8, 'width': 1280 - 16, 'height': 768 - 40}
+        self.hud_crop = {'top': 120 + 32 + (768 - 40) - 180, 'left': 320 + 8, 'width': 400, 'height': 180}
         self.sct = mss()
+
+        if self.auto_snap_window:
+            self._snap_to_window()
 
         # Frame buffer for performance
         self.frame_buffer = deque(maxlen=4)
         self.frame_skip_counter = 0
 
-        # Observation space
+        # Observation space (small + optional grayscale)
         if obs_mode == 'pixels':
-            pixel_space  = spaces.Box(0, 255, (H, W, 3), dtype=np.uint8)
-            hud_space    = spaces.Box(
-                0, 255,
-                (self.hud_crop['height'], self.hud_crop['width'], 3),
-                dtype=np.uint8
-            )
-            sensor_space = spaces.Box(-np.inf, np.inf, (8,), dtype=np.float32)  # Expanded features
-            self.observation_space = spaces.Dict({
-                'pixels':  pixel_space,
-                'hud':      hud_space,
-                'sensors':  sensor_space
-            })
+            out_h, out_w = self.output_res
+            hud_h, hud_w = self.hud_res
+            pixel_space  = spaces.Box(0, 255, (out_h, out_w, self._obs_channels), dtype=np.uint8)
+            hud_space    = spaces.Box(0, 255, (hud_h, hud_w, self._obs_channels), dtype=np.uint8)
+            sensor_space = spaces.Box(-np.inf, np.inf, (8,), dtype=np.float32)
+            self.observation_space = spaces.Dict({'pixels': pixel_space, 'hud': hud_space, 'sensors': sensor_space})
         else:
             self.observation_space = spaces.Box(-np.inf, np.inf, (8,), dtype=np.float32)
 
         # Adaptive reward weights
-        self.alpha       = 1.0   # Height progress
-        self.beta        = 0.5   # Stamina preservation
-        self.kappa       = 1.0   # Stamina loss penalty
-        self.lambda_     = 1.0   # Fall penalty
-        self.mu          = 2.0   # Damage penalty
-        self.nu          = 0.2   # Rope efficiency
-        self.psi         = 0.05  # Action sparsity (reduced)
-        self.phi         = 0.5   # Exploration bonus
-        self.theta       = 0.3   # Efficiency bonus
-        
+        self.alpha = 1.0; self.beta = 0.5; self.kappa = 1.0; self.lambda_ = 1.0
+        self.mu = 2.0; self.nu = 0.2; self.psi = 0.05; self.phi = 0.5; self.theta = 0.3
+
         # Dynamic thresholds
-        self.fall_thr    = self.current_settings['fall_threshold']
-        self.stamina_spam_cooldown = 0.5  # New: prevent stamina exploit
+        self.fall_thr = self.current_settings['fall_threshold']
+        self.stamina_spam_cooldown = 0.5
 
         # Internal state
-        self._lock            = threading.Lock()
-        self._prev_y          = 0.0
-        self._current_y       = 0.0
-        self._current_x       = 0.0
-        self._prev_stamina    = 1.0
-        self._prev_py         = None
-        self._prev_action_hash = None
+        self._lock = threading.Lock()
+        self._prev_y = 0.0; self._current_y = 0.0; self._current_x = 0.0
+        self._prev_stamina = 1.0; self._prev_py = None; self._prev_action_hash = None
         self._last_climb_time = 0
-        self._estimated_summit_height = 1000.0  # Will be updated
-        
-        # Tracking for rewards
+        self._estimated_summit_height = 1000.0
+
+        # Tracking
         self.visitation_counts = defaultdict(int)
         self.visited_cells = set()
         self.repetition_count = 0
         self.episode_count = 0
         self.success_count = 0
         self.time_since_checkpoint = 0
-        
+
         # Async action executor
         self.executor = ThreadPoolExecutor(max_workers=2)
 
-        # Load templates with error handling
+        # Templates and HUD detection settings
         self._load_templates()
-        
-        # HSV bounds for stamina bar (updated for new UI)
-        self.stamina_lower    = np.array([40,  50,  50])
-        self.stamina_upper    = np.array([80, 255, 255])
+        self.stamina_lower = np.array([40, 50, 50])
+        self.stamina_upper = np.array([80, 255, 255])
 
         time.sleep(1.0)
 
     def _load_templates(self):
-        """Load template images with fallback"""
         try:
             self.player_template = cv2.imread('player_template.png')
             self.summit_template = cv2.imread('summit_template.png')
@@ -135,119 +128,158 @@ class PeakEnv(gym.Env):
             print(f"Error loading templates: {e}")
             self.use_templates = False
 
+    def _snap_to_window(self):
+        """Find the target window and set crop/hud_crop to its exact client area."""
+        # Make coordinates DPI-aware
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+        import win32gui
+
+        hwnd = None
+
+        # Prefer a specific window title if provided
+        if getattr(self, "window_title", None):
+            try:
+                import pygetwindow as gw
+                wins = gw.getWindowsWithTitle(self.window_title)
+                if wins:
+                    w = wins[0]
+                    if w.isMinimized:
+                        w.restore()
+                    hwnd = w._hWnd
+            except Exception:
+                hwnd = None
+
+        # Fallback: foreground window
+        if hwnd is None:
+            try:
+                hwnd = win32gui.GetForegroundWindow()
+            except Exception:
+                hwnd = None
+
+        if not hwnd:
+            print("[PeakEnv] Could not locate window; keeping previous crop.")
+            return
+
+        # Get exact client rect in *screen* coordinates
+        try:
+            # Client rect in client coords (0,0) to (w,h)
+            left_client, top_client, right_client, bottom_client = win32gui.GetClientRect(hwnd)
+            # Convert client (0,0) and (w,h) to screen coords
+            left, top = win32gui.ClientToScreen(hwnd, (left_client, top_client))
+            right, bottom = win32gui.ClientToScreen(hwnd, (right_client, bottom_client))
+            width, height = right - left, bottom - top
+        except Exception as e:
+            print(f"[PeakEnv] GetClientRect/ClientToScreen failed: {e}")
+            return
+
+        # Main capture: full client area (whatever size your window is)
+        self.crop = {'top': int(top), 'left': int(left), 'width': int(width), 'height': int(height)}
+
+        # HUD region (example: bottom-left portion; tweak fractions if needed)
+        hud_w = int(width * 0.30)
+        hud_h = int(height * 0.22)
+        self.hud_crop = {
+            'top': int(top + height - hud_h),
+            'left': int(left),
+            'width': hud_w,
+            'height': hud_h
+        }
+
+        print(f"[PeakEnv] Snap window -> crop={self.crop}, hud_crop={self.hud_crop}")
+
     def reset(self, seed=None, options=None):
-        """Reset environment with improved state tracking"""
         super().reset(seed=seed)
-        
         pyautogui.press('r')
-        time.sleep(self.dt * 2)  # Give more time for reset
-        
+        time.sleep(self.dt * 2)
+
+        if self.auto_snap_window:
+            self._snap_to_window()
+
         obs = self._get_obs()
-        self._prev_y       = self._extract_y(obs['pixels'] if self.obs_mode=='pixels' else None)
-        self._current_y    = self._prev_y
+        self._prev_y = self._extract_y(obs['pixels'] if self.obs_mode == 'pixels' else None)
+        self._current_y = self._prev_y
         self._prev_stamina = self._get_stamina()
-        
-        # Reset tracking
+
         self.visited_cells.clear()
         self.repetition_count = 0
         self.time_since_checkpoint = 0
         self._last_climb_time = 0
         self._prev_py = None
         self._prev_action_hash = None
-        
-        # Adjust difficulty if needed
+
         if self.episode_count > 0 and self.episode_count % 50 == 0:
             self._adjust_difficulty()
-        
         self.episode_count += 1
-        
-        info = {'difficulty': self.difficulty}
-        return obs, info
+        return obs, {'difficulty': self.difficulty}
 
     def step(self, action):
-        """Execute action with new mechanics and optimizations"""
         keys, cam, scr = action['keys'], action['camera'], action['scroll']
 
-        # Check the length to handle both old and new formats
         if len(keys) == 11:
-            mh, mv, jmp, spr, crh, itc, drp, emo, png, clb, _ = keys  # 11 elements
+            mh, mv, jmp, spr, crh, itc, drp, emo, png, clb, _ = keys
         else:
-            mh, mv, jmp, spr, crh, itc, drp, emo, png, clb = keys  # 10 elements
+            mh, mv, jmp, spr, crh, itc, drp, emo, png, clb = keys
 
-        # Check for stamina spam exploit prevention (new in latest patch)
         current_time = time.time()
         if self._prev_stamina < 0.1 and clb:
             if current_time - self._last_climb_time < self.stamina_spam_cooldown:
-                clb = 0  # Ignore climb action
+                clb = 0
             else:
                 self._last_climb_time = current_time
 
-        # Execute actions asynchronously for better performance
         action_future = self.executor.submit(
-            self._execute_actions,
-            mh, mv, jmp, spr, crh, itc, drp, emo, png, clb, cam, scr
+            self._execute_actions, mh, mv, jmp, spr, crh, itc, drp, emo, png, clb, cam, scr
         )
 
-        # Get observation while actions execute
         time.sleep(self.dt)
         obs = self._get_obs()
-        
-        # Ensure actions completed
+
         try:
             action_future.result(timeout=0.1)
         except:
-            pass  # Continue even if action times out
-        
-        # Calculate state changes
-        frame   = obs['pixels'] if self.obs_mode=='pixels' else None
-        curr_y  = self._extract_y(frame)
+            pass
+
+        frame = obs['pixels'] if self.obs_mode == 'pixels' else None
+        curr_y = self._extract_y(frame)
         delta_y = curr_y - self._prev_y
         self._current_y = curr_y
 
         stamina = self._get_stamina()
-        damage  = self._get_damage_flag()
+        damage = self._get_damage_flag()
+        reward = self._calculate_adaptive_reward(delta_y, stamina, damage, action, obs)
 
-        # Calculate adaptive reward
-        reward = self._calculate_adaptive_reward(
-            delta_y, stamina, damage, action, obs
-        )
-
-        # Update state
-        self._prev_y       = curr_y
+        self._prev_y = curr_y
         self._prev_stamina = stamina
         self._prev_action_hash = hash(tuple(keys))
         self.time_since_checkpoint += self.dt
 
-        # Check terminal condition
         terminated = False
         if frame is not None and self.use_templates:
-            terminated = self._check_summit(frame)
+            terminated = self._check_summit_raw()  # use raw-sized frame via template matching
             if terminated:
-                reward += 100.0  # Summit bonus
+                reward += 100.0
                 self.success_count += 1
 
-        # Truncated if episode is too long
         truncated = False
-        
         info = {
             'height': curr_y,
             'stamina': stamina,
-            'episode': self.episode_count,
+            'ep_count': self.episode_count,
             'success_rate': self.success_count / max(1, self.episode_count)
         }
-
         return obs, reward, terminated, truncated, info
 
     def _execute_actions(self, mh, mv, jmp, spr, crh, itc, drp, emo, png, clb, cam, scr):
-        """Execute keyboard and mouse actions"""
         try:
-            # Movement
             if mh == 0: pyautogui.press('a')
             elif mh == 2: pyautogui.press('d')
             if mv == 0: pyautogui.press('s')
             elif mv == 2: pyautogui.press('w')
-            
-            # Actions
             if jmp: pyautogui.press('space')
             if spr: pyautogui.press('shift')
             if crh: pyautogui.press('ctrl')
@@ -259,32 +291,20 @@ class PeakEnv(gym.Env):
                 pyautogui.mouseDown(button='left')
                 time.sleep(0.05)
                 pyautogui.mouseUp(button='left')
-
-            # Camera control
             dyaw, dpitch = cam
             pyautogui.moveRel(int(dyaw * 10), int(dpitch * 10))
-            
-            # Scroll (rope control)
             pyautogui.scroll(int(scr[0] * 5))
         except:
-            pass  # Continue even if action fails
+            pass
 
     def _calculate_adaptive_reward(self, delta_y, stamina, damage, action, obs):
-        """Enhanced reward calculation with adaptive components"""
-        keys = action['keys']
-        scr = action['scroll']
-        
-        # Progress multiplier based on height
+        keys = action['keys']; scr = action['scroll']
         progress_mult = min(2.0, 1.0 + (self._current_y / self._estimated_summit_height))
-        
-        # Exploration bonus for new areas
         grid_cell = (int(self._current_x / 50), int(self._current_y / 50))
         exploration_bonus = 0
         if grid_cell not in self.visited_cells:
             self.visited_cells.add(grid_cell)
             exploration_bonus = self.phi
-        
-        # Action repetition penalty
         action_hash = hash(tuple(keys))
         if action_hash == self._prev_action_hash:
             self.repetition_count += 1
@@ -292,38 +312,26 @@ class PeakEnv(gym.Env):
         else:
             self.repetition_count = 0
             repetition_penalty = 0
-        
-        # Efficiency bonus for smooth climbing
         efficiency_bonus = 0
         if delta_y > 0 and stamina > 0.3:
             efficiency_bonus = self.theta * min(1.0, delta_y / 10.0)
-        
-        # Stamina management
         stamina_drop = max(0.0, self._prev_stamina - stamina)
         stamina_bonus = self.beta * stamina * self.current_settings['stamina_mult']
-        
-        # Fall penalty
         fall_mag = max(0.0, -delta_y - self.fall_thr)
-        
-        # Rope efficiency
         rope_eff = self.nu * (1.0 - abs(scr[0]))
-        
-        # Action sparsity (reduced penalty)
-        # Handle both 10 and 11 element formats
+
         if len(keys) == 11:
-            mh, mv, jmp, spr, crh, itc, drp, emo, png, clb, _ = keys  # 11 elements
+            mh, mv, jmp, spr, crh, itc, drp, emo, png, clb, _ = keys
         else:
-            mh, mv, jmp, spr, crh, itc, drp, emo, png, clb = keys  # 10 elements
+            mh, mv, jmp, spr, crh, itc, drp, emo, png, clb = keys
         sparsity_count = (mh != 1) + (mv != 1) + jmp + spr + crh + itc + drp + emo + png + clb
         action_sparsity_pen = self.psi * sparsity_count
-        
-        # Curiosity reward using state visitation
+
         sensors = obs['sensors'] if self.obs_mode == 'pixels' else obs
         state_key = tuple(round(float(x), 2) for x in sensors[:4].tolist())
         self.visitation_counts[state_key] += 1
         curiosity_reward = self.phi / math.sqrt(self.visitation_counts[state_key])
-        
-        # Combine all reward components
+
         reward = (
             self.alpha * delta_y * progress_mult
             + stamina_bonus
@@ -337,11 +345,9 @@ class PeakEnv(gym.Env):
             + exploration_bonus
             + curiosity_reward
         ) * self.current_settings['reward_scale']
-        
         return reward
 
     def render(self, mode='human'):
-        """Render the environment"""
         if self.obs_mode == 'pixels':
             frame = self._get_obs()['pixels']
             if mode == 'human':
@@ -351,303 +357,202 @@ class PeakEnv(gym.Env):
                 return frame
 
     def close(self):
-        """Clean up resources"""
         if self.obs_mode == 'pixels':
             cv2.destroyAllWindows()
         self.executor.shutdown(wait=False)
 
+    def _resize_and_maybe_gray(self, img, target_hw):
+        out_h, out_w = target_hw
+        img_small = cv2.resize(img, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        if self.grayscale:
+            img_small = cv2.cvtColor(img_small, cv2.COLOR_RGB2GRAY)
+            img_small = img_small[..., None]
+        return img_small
+
     def _get_obs(self):
-        """Get observation with frame buffering for performance"""
+        """Capture raw frames, then downscale & (optionally) grayscale for the agent."""
         if self.frame_skip_counter % self.frame_skip == 0:
             if self.obs_mode == 'pixels':
                 with self._lock:
-                    frame = np.array(self.sct.grab(self.crop))[:, :, :3]
-                    hud   = np.array(self.sct.grab(self.hud_crop))[:, :, :3]
-                    self.frame_buffer.append((frame, hud))
+                    frame_raw = np.array(self.sct.grab(self.crop))[:, :, :3]
+                    hud_raw   = np.array(self.sct.grab(self.hud_crop))[:, :, :3]
+                    self.frame_buffer.append((frame_raw, hud_raw))
             self.frame_skip_counter = 0
         else:
             self.frame_skip_counter += 1
-        
+
         if self.obs_mode == 'pixels':
             if len(self.frame_buffer) > 0:
-                frame, hud = self.frame_buffer[-1]
+                frame_raw, hud_raw = self.frame_buffer[-1]
             else:
                 with self._lock:
-                    frame = np.array(self.sct.grab(self.crop))[:, :, :3]
-                    hud   = np.array(self.sct.grab(self.hud_crop))[:, :, :3]
+                    frame_raw = np.array(self.sct.grab(self.crop))[:, :, :3]
+                    hud_raw   = np.array(self.sct.grab(self.hud_crop))[:, :, :3]
+
+            # Return SMALL frames to the agent
+            frame_small = self._resize_and_maybe_gray(frame_raw, self.output_res)
+            hud_small   = self._resize_and_maybe_gray(hud_raw, self.hud_res)
+
             sensors = self._get_enhanced_sensors()
-            return {'pixels': frame, 'hud': hud, 'sensors': sensors}
+            return {'pixels': frame_small, 'hud': hud_small, 'sensors': sensors}
         else:
             return self._get_enhanced_sensors()
 
     def _get_enhanced_sensors(self):
-        """Get enhanced sensor features for better state representation"""
-        # Basic state
         px, py, vy = self._extract_player_state()
         stamina = self._get_stamina()
-        
-        # Normalize positions
         px_norm = px / self.crop['width'] if self.crop['width'] > 0 else 0
         py_norm = py / self.crop['height'] if self.crop['height'] > 0 else 0
         vy_norm = np.clip(vy / 100.0, -1.0, 1.0)
-        
-        # Additional features
         grip_quality = self._estimate_grip_quality()
         path_gradient = self._estimate_path_gradient()
         time_norm = min(1.0, self.time_since_checkpoint / 60.0)
         height_progress = min(1.0, self._current_y / self._estimated_summit_height)
-        
         return np.array([
             px_norm, py_norm, vy_norm, stamina,
             grip_quality, path_gradient, time_norm, height_progress
         ], dtype=np.float32)
 
     def _extract_player_state(self):
-        """Extract player position and velocity using template matching"""
         if not self.use_templates:
-            # Fallback: use simple color detection
             return self._extract_player_state_fallback()
-        
         try:
             if len(self.frame_buffer) > 0:
                 frame, _ = self.frame_buffer[-1]
             else:
                 frame = np.array(self.sct.grab(self.crop))[:, :, :3]
-            
             gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-            res = cv2.matchTemplate(gray, cv2.cvtColor(self.player_template, cv2.COLOR_BGR2GRAY), 
-                                  cv2.TM_CCOEFF_NORMED)
+            res = cv2.matchTemplate(gray, cv2.cvtColor(self.player_template, cv2.COLOR_BGR2GRAY),
+                                    cv2.TM_CCOEFF_NORMED)
             _, max_val, _, (px, py) = cv2.minMaxLoc(res)
-            
-            if max_val < 0.5:  # Low confidence
+            if max_val < 0.5:
                 return self._extract_player_state_fallback()
-            
-            # Calculate velocity
             if self._prev_py is not None:
                 vy = (py - self._prev_py) / (self.dt * max(1, self.frame_skip))
             else:
                 vy = 0.0
-            
             self._prev_py = py
             self._current_x = float(px)
-            
             return float(px), float(py), float(vy)
-        except Exception as e:
+        except Exception:
             return self._extract_player_state_fallback()
 
     def _extract_player_state_fallback(self):
-        """Fallback method using color detection"""
         return self.crop['width'] / 2, self._current_y, 0.0
 
     def _get_stamina(self):
-        """Extract stamina from HUD with improved detection"""
         try:
             if len(self.frame_buffer) > 0:
-                _, hud = self.frame_buffer[-1]
+                _, hud = self.frame_buffer[-1]   # use RAW hud for color detection
             else:
                 hud = np.array(self.sct.grab(self.hud_crop))[:, :, :3]
-            
             hsv = cv2.cvtColor(hud, cv2.COLOR_RGB2HSV)
             mask = cv2.inRange(hsv, self.stamina_lower, self.stamina_upper)
-            
-            # Apply morphological operations to reduce noise
             kernel = np.ones((3, 3), np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-            
-            filled = cv2.countNonZero(mask)
-            total = mask.size
-            
+            filled = cv2.countNonZero(mask); total = mask.size
             return float(np.clip(filled / total if total > 0 else 0, 0.0, 1.0))
-        except Exception as e:
-            return 0.5  # Default middle value
+        except Exception:
+            return 0.5
 
     def _get_damage_flag(self):
-        """Detect if player took damage (enhanced detection)"""
         try:
             if len(self.frame_buffer) > 0:
                 frame, _ = self.frame_buffer[-1]
             else:
                 frame = np.array(self.sct.grab(self.crop))[:, :, :3]
-            
-            # Check for red flash (damage indicator)
             red_channel = frame[:, :, 0]
             red_mean = np.mean(red_channel)
-            
-            # Damage typically causes a red tint
             if red_mean > 150:
                 return 1.0
-            
             return 0.0
         except:
             return 0.0
 
     def _estimate_grip_quality(self):
-        """Estimate surface grip quality based on visual cues"""
         try:
             if len(self.frame_buffer) > 0:
                 frame, _ = self.frame_buffer[-1]
             else:
                 frame = np.array(self.sct.grab(self.crop))[:, :, :3]
-            
-            # Simple texture analysis for grip estimation
             gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-            
-            # Get region around player
             h, w = gray.shape
             roi = gray[h//2-50:h//2+50, w//2-50:w//2+50]
-            
-            # Calculate texture variance (rough surfaces have higher variance)
             variance = np.var(roi)
-            
-            # Normalize to 0-1 (higher is better grip)
             grip = np.clip(variance / 1000.0, 0.0, 1.0)
-            
             return float(grip)
         except:
             return 0.5
 
     def _estimate_path_gradient(self):
-        """Estimate the slope/gradient of the climbing path"""
         try:
             if len(self.frame_buffer) > 0:
                 frame, _ = self.frame_buffer[-1]
             else:
                 frame = np.array(self.sct.grab(self.crop))[:, :, :3]
-            
-            # Edge detection to find climbing surfaces
             gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
             edges = cv2.Canny(gray, 50, 150)
-            
-            # Focus on center region
             h, w = edges.shape
             roi = edges[h//3:2*h//3, w//3:2*w//3]
-            
-            # Detect dominant line angle using Hough transform
             lines = cv2.HoughLines(roi, 1, np.pi/180, 50)
-            
             if lines is not None and len(lines) > 0:
-                # Get average angle
-                angles = [line[0][1] for line in lines[:5]]  # Top 5 lines
+                angles = [line[0][1] for line in lines[:5]]
                 avg_angle = np.mean(angles)
-                
-                # Convert to gradient (-1 to 1, where 0 is horizontal)
                 gradient = np.sin(avg_angle)
                 return float(gradient)
-            
             return 0.0
         except:
             return 0.0
 
-    def _extract_y(self, frame):
-        """Extract vertical position from frame"""
-        if frame is None:
+    def _extract_y(self, frame_small):
+        if frame_small is None:
             return self._current_y
-        
         try:
-            # Look for height indicators (white markers, UI elements, etc.)
-            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-            
-            # Find bright regions (potential height markers)
+            # frame_small is already downscaled (and maybe grayscale)
+            if self.grayscale:
+                gray = frame_small[..., 0]
+            else:
+                gray = cv2.cvtColor(frame_small, cv2.COLOR_RGB2GRAY)
             _, bright = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
-            
-            # Get vertical positions of bright pixels
             ys = np.where(bright > 0)[0]
-            
             if len(ys) > 0:
-                # Use median for robustness
                 return float(np.median(ys))
             else:
                 return self._current_y
         except:
             return self._current_y
 
-    def _check_summit(self, frame):
-        """Check if summit is reached"""
+    def _check_summit_raw(self):
+        """Template match on RAW-sized frame (more reliable than tiny frame)."""
         if not self.use_templates:
-            # Fallback: check if at top of screen
             return self._current_y < 50
-        
         try:
+            if len(self.frame_buffer) > 0:
+                frame, _ = self.frame_buffer[-1]
+            else:
+                frame = np.array(self.sct.grab(self.crop))[:, :, :3]
             gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
             summit_gray = cv2.cvtColor(self.summit_template, cv2.COLOR_BGR2GRAY)
-            
             res = cv2.matchTemplate(gray, summit_gray, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, _ = cv2.minMaxLoc(res)
-            
-            return bool(max_val > 0.7)  # Lower threshold for better detection
+            return bool(max_val > 0.7)
         except:
             return False
 
     def _adjust_difficulty(self):
-        """Adjust difficulty based on performance (curriculum learning)"""
         success_rate = self.success_count / max(1, self.episode_count)
-        
         if success_rate > 0.7 and self.difficulty != 'hard':
-            # Increase difficulty
-            if self.difficulty == 'easy':
-                self.difficulty = 'medium'
-            else:
-                self.difficulty = 'hard'
+            self.difficulty = 'medium' if self.difficulty == 'easy' else 'hard'
             print(f"Difficulty increased to: {self.difficulty}")
         elif success_rate < 0.3 and self.difficulty != 'easy':
-            # Decrease difficulty
-            if self.difficulty == 'hard':
-                self.difficulty = 'medium'
-            else:
-                self.difficulty = 'easy'
+            self.difficulty = 'medium' if self.difficulty == 'hard' else 'easy'
             print(f"Difficulty decreased to: {self.difficulty}")
-        
         self.current_settings = self.difficulty_settings[self.difficulty]
         self.fall_thr = self.current_settings['fall_threshold']
-
-    def capture_templates(self):
-        """Utility to capture template images while in-game"""
-        try:
-            import keyboard
-        except ImportError:
-            print("Please install keyboard: pip install keyboard")
-            return
-        
-        print("=== Template Capture Utility ===")
-        print("Make sure Peak game is running and visible")
-        
-        print("\n1. Position player character in center of screen")
-        print("   Press 'p' when ready...")
-        keyboard.wait('p')
-        
-        # Capture player template
-        player_region = {
-            'top': self.crop['top'] + self.crop['height']//2 - 50,
-            'left': self.crop['left'] + self.crop['width']//2 - 40,
-            'width': 80,
-            'height': 100
-        }
-        player_img = np.array(self.sct.grab(player_region))[:, :, :3]
-        cv2.imwrite('player_template.png', cv2.cvtColor(player_img, cv2.COLOR_RGB2BGR))
-        print("✓ Player template saved")
-        
-        print("\n2. Navigate to summit marker/flag")
-        print("   Press 's' when summit is visible...")
-        keyboard.wait('s')
-        
-        # Capture summit template
-        summit_region = {
-            'top': self.crop['top'] + 100,
-            'left': self.crop['left'] + self.crop['width']//2 - 100,
-            'width': 200,
-            'height': 150
-        }
-        summit_img = np.array(self.sct.grab(summit_region))[:, :, :3]
-        cv2.imwrite('summit_template.png', cv2.cvtColor(summit_img, cv2.COLOR_RGB2BGR))
-        print("✓ Summit template saved")
-        
-        print("\nTemplates captured successfully!")
-        print("You can now start training.")
 
 # Register the enhanced environment
 from gymnasium.envs.registration import register
 
-# Unregister if exists
 try:
     gym.envs.registry.pop('Peak-v4')
 except:
@@ -656,10 +561,13 @@ except:
 register(
     id='Peak-v4',
     entry_point='peak_env:PeakEnv',
-    max_episode_steps=2000,  # Increased for harder difficulties
+    max_episode_steps=2000,
     kwargs={
         'obs_mode': 'pixels',
-        'difficulty': 'easy',  # Start with easy for curriculum learning
-        'frame_skip': 2
+        'difficulty': 'easy',
+        'frame_skip': 2,
+        'output_res': (128, 128),   # <— small
+        'hud_res': (64, 128),       # <— small
+        'grayscale': True           # <— 1 channel
     }
 )

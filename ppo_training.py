@@ -17,16 +17,25 @@ from peak_env_wrapper import make_wrapped_env  # Import the wrapper
 
 class CustomCNN(BaseFeaturesExtractor):
     """Custom CNN with attention mechanism for Peak visual processing"""
-    
+
     def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 512):
-        # Calculate the correct input channels
         super().__init__(observation_space, features_dim)
-        
-        n_input_channels = observation_space["pixels"].shape[2]
-        
-        # CNN for main view
+
+        # Detect channel order for both pixel streams
+        pix_shape = observation_space["pixels"].shape  # e.g., (H,W,C) or (C,H,W)
+        hud_shape = observation_space["hud"].shape
+
+        def detect_c_first(shape):
+            return len(shape) == 3 and shape[0] in (1, 3, 4)
+
+        self.pixels_channels_first = detect_c_first(pix_shape)
+        self.hud_channels_first    = detect_c_first(hud_shape)
+
+        n_ch_pixels = pix_shape[0] if self.pixels_channels_first else pix_shape[2]
+        n_ch_hud    = hud_shape[0] if self.hud_channels_first    else hud_shape[2]
+
         self.cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4, padding=0),
+            nn.Conv2d(n_ch_pixels, 32, kernel_size=8, stride=4, padding=0),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
             nn.ReLU(),
@@ -34,62 +43,56 @@ class CustomCNN(BaseFeaturesExtractor):
             nn.ReLU(),
             nn.Flatten(),
         )
-        
-        # CNN for HUD
+
         self.hud_cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 16, kernel_size=4, stride=2, padding=0),
+            nn.Conv2d(n_ch_hud, 16, kernel_size=4, stride=2, padding=0),
             nn.ReLU(),
             nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=0),
             nn.ReLU(),
             nn.Flatten(),
         )
-        
-        # Attention mechanism for focusing on important regions
+
         self.attention = nn.Sequential(
             nn.Linear(64, 32),
             nn.ReLU(),
             nn.Linear(32, 1),
             nn.Sigmoid()
         )
-        
-        # Calculate CNN output dimensions
+
         with torch.no_grad():
-            sample_pixels = torch.zeros(1, *observation_space["pixels"].shape)
-            sample_pixels = sample_pixels.permute(0, 3, 1, 2)  # NHWC to NCHW
+            sample_pixels = torch.zeros(1, *pix_shape)
+            if not self.pixels_channels_first:
+                sample_pixels = sample_pixels.permute(0, 3, 1, 2)
             cnn_out = self.cnn(sample_pixels)
-            
-            sample_hud = torch.zeros(1, *observation_space["hud"].shape)
-            sample_hud = sample_hud.permute(0, 3, 1, 2)
+
+            sample_hud = torch.zeros(1, *hud_shape)
+            if not self.hud_channels_first:
+                sample_hud = sample_hud.permute(0, 3, 1, 2)
             hud_out = self.hud_cnn(sample_hud)
-            
+
             n_flatten = cnn_out.shape[1] + hud_out.shape[1] + observation_space["sensors"].shape[0]
-        
-        # Final linear layer
+
         self.linear = nn.Sequential(
             nn.Linear(n_flatten, features_dim),
             nn.ReLU(),
-            nn.LayerNorm(features_dim)
+            nn.LayerNorm(features_dim),
         )
 
     def forward(self, observations) -> torch.Tensor:
-        # Extract components
-        pixels = observations["pixels"].float() / 255.0
-        hud = observations["hud"].float() / 255.0
+        pixels  = observations["pixels"].float() / 255.0
+        hud     = observations["hud"].float() / 255.0
         sensors = observations["sensors"].float()
-        
-        # Permute to NCHW format for Conv2d
-        pixels = pixels.permute(0, 3, 1, 2)
-        hud = hud.permute(0, 3, 1, 2)
-        
-        # Process visual inputs
+
+        if not self.pixels_channels_first:
+            pixels = pixels.permute(0, 3, 1, 2)
+        if not self.hud_channels_first:
+            hud = hud.permute(0, 3, 1, 2)
+
         cnn_features = self.cnn(pixels)
         hud_features = self.hud_cnn(hud)
-        
-        # Concatenate all features
-        combined = torch.cat([cnn_features, hud_features, sensors], dim=1)
-        
-        return self.linear(combined)
 
+        combined = torch.cat([cnn_features, hud_features, sensors], dim=1)
+        return self.linear(combined)
 
 class CurriculumCallback(CheckpointCallback):
     """Custom callback for curriculum learning and monitoring"""
@@ -165,15 +168,14 @@ def main(args):
 
     # Create vectorized environment WITH WRAPPER
     print(f"Creating {args.n_envs} parallel environments...")
-
-    # Import the wrapper function
-    from peak_env_wrapper import make_wrapped_env
-
     if args.vec_env_type == "dummy":
-        env_fns = [make_wrapped_env(i, seed=args.seed, log_dir=args.log_dir,
-                                    difficulty=args.start_difficulty, frame_skip=args.frame_skip,
-                                    use_simplified=args.use_simplified)
-                   for i in range(args.n_envs)]
+        env_fns = [make_wrapped_env(
+            i, seed=args.seed, log_dir=args.log_dir,
+            difficulty=args.start_difficulty, frame_skip=args.frame_skip,
+            use_simplified=args.use_simplified,
+            window_title=args.window_title,
+            auto_snap_window=not args.no_auto_snap_window
+        ) for i in range(args.n_envs)]
         vec_env = DummyVecEnv(env_fns)
     else:
         env_fns = [make_wrapped_env(i, seed=args.seed, log_dir=args.log_dir,
@@ -195,21 +197,20 @@ def main(args):
         save_replay_buffer=False,
         verbose=1
     )
-    
-    # Evaluation environment
-    from peak_env_wrapper import FlattenActionWrapper, SimplifiedPeakWrapper
 
-    # Create eval env with wrapper
-    eval_env = gym.make("Peak-v4", obs_mode='pixels', difficulty='medium', frame_skip=args.frame_skip)
-    if args.use_simplified:
-        eval_env = SimplifiedPeakWrapper(eval_env)
-    else:
-        eval_env = FlattenActionWrapper(eval_env)
-    eval_env = Monitor(
-        eval_env,
-        filename=os.path.join(args.log_dir, "ppo_eval.csv"),
-        info_keywords=('height', 'stamina', 'success_rate')
-    )
+    # Evaluation environment (vectorized + same wrappers via make_wrapped_env)
+    eval_env_fns = [make_wrapped_env(
+        999, seed=args.seed + 1000, log_dir=args.log_dir,
+        difficulty='medium', frame_skip=args.frame_skip,
+        use_simplified=args.use_simplified,
+        window_title=args.window_title,
+        auto_snap_window=not args.no_auto_snap_window
+    )]
+    eval_env = DummyVecEnv(eval_env_fns)
+    eval_env = VecMonitor(eval_env)
+
+    print("Train env type:", type(vec_env))
+    print("Eval  env type:", type(eval_env))
     
     eval_cb = EvalCallback(
         eval_env,
@@ -358,8 +359,8 @@ if __name__ == "__main__":
     # PPO hyperparameters
     parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--use_linear_schedule", action="store_true", help="Use linear LR schedule")
-    parser.add_argument("--n_steps", type=int, default=2048, help="Number of steps per environment")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
+    parser.add_argument("--n_steps", type=int, default=128, help="Number of steps per environment")
+    parser.add_argument("--batch_size", type=int, default=256, help="Batch size for training")
     parser.add_argument("--n_epochs", type=int, default=10, help="Number of epochs per update")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE lambda")
@@ -383,6 +384,13 @@ if __name__ == "__main__":
                        help="Tensorboard log directory")
     parser.add_argument("--save_path", type=str, default="ppo_peak_final", 
                        help="Path to save final model")
+
+    # argparse
+    #parser.add_argument("--progress_bar", action="store_true", help="Show a tqdm/rich progress bar")
+    parser.add_argument("--window_title", type=str, default=None,
+                        help="Substring of the game window title to snap the capture to")
+    parser.add_argument("--no_auto_snap_window", action="store_true",
+                        help="Disable automatic window snapping")
     
     args = parser.parse_args()
     main(args)

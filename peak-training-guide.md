@@ -37,6 +37,8 @@ python setup_and_test.py --capture
 # 2. Climb to first summit (or find "SUMMIT" text image)
 # 3. Press 's' when "SUMMIT" text is visible
 ```
+#look at the agent during training
+tensorboard --logdir C:\Users\nowak\Peak-Reninforce-Learning\tensorboard --port 6006
 
 ---
 
